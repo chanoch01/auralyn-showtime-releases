@@ -1,130 +1,215 @@
-# Builds the Mac versions of Auralyn Showtime (Apple Silicon and Intel) and attaches them to a
-# release in this repository. This repository is public, so GitHub's Mac runners cost nothing here,
-# while the private code repository would pay for every Mac minute.
+# Mac downloads of Auralyn Showtime, built for free.
 #
-# Started by hand: Actions → Build Mac → Run workflow. It reads the private source with one secret,
-# set in this repository's Settings → Secrets and variables → Actions:
-#   SOURCE_READ_TOKEN  a fine-grained token with "Contents: read-only" on chanoch01/auralyn-showtime only.
+# This repository is public, so GitHub-hosted runners (macos-latest included) cost nothing here,
+# while the private code repository's cloud spending is capped at $0. The same file lives in the
+# code repository as docs/public-repo-build-mac.yml; keep the two the same.
 #
-# Note: this repository is public, so the build log below can be read by anyone. It shows test
-# names and file paths from the private source, not the source itself.
+# Set up once, in this repository's Settings → Secrets and variables → Actions:
+#   SOURCE_READ_TOKEN  a fine-grained token, resource owner chanoch01, repository access
+#                      chanoch01/auralyn-showtime only, permission "Contents: Read-only".
+# Publishing into the releases repository itself uses the workflow's own GITHUB_TOKEN.
+#
+# Run it from Actions → Build Mac → Run workflow, after the Windows release for that version exists
+# (or before: the upload makes the release if it isn't there yet). It builds, for Apple Silicon and
+# Intel: the plugin shim (native/, CMake), the app (dotnet publish), a .app bundle with an ad-hoc
+# signature, and a self-updating Velopack package on its own channel (osx-arm64 / osx-x64), and
+# adds them to the release.
+#
+# The logs of a public repository are public: they show test names and file paths from the
+# private source, never the source itself. The whole test suite runs on a Mac first (on by default)
+# and nothing is attached unless it passes.
 name: Build Mac
 
 on:
   workflow_dispatch:
     inputs:
-      tag:
-        description: Release to attach the Mac builds to (made if it doesn't exist yet)
-        required: true
-        default: v1.0.1
       ref:
         description: Branch, tag or commit of chanoch01/auralyn-showtime to build
-        required: true
         default: main
+        required: true
+      tag:
+        description: Release tag to add the Mac downloads to (v + the VERSION file when empty)
+        default: ''
+        required: false
+      test:
+        description: Run the whole test suite on a Mac first, and attach nothing unless it passes
+        type: boolean
+        default: true
 
 permissions:
   contents: write
 
 concurrency:
-  group: build-mac-${{ inputs.tag }}
+  group: build-mac
   cancel-in-progress: false
 
 env:
-  # Must match the Velopack package version in src/AuralynShowtime.Desktop/AuralynShowtime.Desktop.csproj.
+  SOURCE_REPO: chanoch01/auralyn-showtime
+  # Must match the Velopack package in the app and VPK_VERSION in the source's release workflow.
   VPK_VERSION: 1.2.161
   DOTNET_CLI_TELEMETRY_OPTOUT: '1'
   DOTNET_NOLOGO: '1'
 
 jobs:
-  mac:
+  # The desktop UI tests start the real app (headless) on macOS, so the Mac's data folder, SQLite
+  # and Skia libraries and the phone server's port are exercised before anything is released.
+  test:
+    if: inputs.test
     runs-on: macos-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Check out the app's source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
-          repository: chanoch01/auralyn-showtime
+          repository: ${{ env.SOURCE_REPO }}
           ref: ${{ inputs.ref }}
           token: ${{ secrets.SOURCE_READ_TOKEN }}
           persist-credentials: false
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 10.0.x
 
-      - name: Tools
-        run: |
-          cmake --version
-          dotnet tool update -g vpk --version "$VPK_VERSION"
-          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
-
-      # The release's number comes from the tag (v1.0.1 → 1.0.1), so the Mac and Windows builds agree.
-      - name: Version
-        id: version
-        env:
-          TAG: ${{ inputs.tag }}
-        run: |
-          number="${TAG#v}"
-          if ! [[ "$number" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::The tag must look like v1.2.3, not '$TAG'."
-            exit 1
-          fi
-          echo "number=$number" >> "$GITHUB_OUTPUT"
-
-      # One universal build of the plugin shim (VST 3 hosting) serves both Macs.
-      - name: Build the plugin shim (universal)
-        run: |
-          cmake -S native -B native/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
-          cmake --build native/build --config Release
-
-      - name: Test the plugin shim
-        run: ctest --test-dir native/build -C Release --output-on-failure
-
-      # Nothing is attached unless every test passes.
-      - name: Test
+      - name: Test on a Mac
         run: dotnet test AuralynShowtime.slnx -c Release
 
-      - name: Publish and pack (Apple Silicon and Intel)
+  mac:
+    needs: test
+    # Skipped tests (unticked) don't hold the build back; failed ones do.
+    if: ${{ !cancelled() && needs.test.result != 'failure' }}
+    runs-on: macos-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      # One at a time: both add to the same release, and the first may have to make it.
+      max-parallel: 1
+      matrix:
+        include:
+          - rid: osx-arm64
+            arch: arm64
+            name: AppleSilicon
+          - rid: osx-x64
+            arch: x86_64
+            name: Intel
+    steps:
+      - name: Check out the app's source
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          path: src
+          persist-credentials: false
+
+      - name: Version and tag
+        id: version
+        working-directory: src
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+        run: |
+          number="$(head -n 1 VERSION | tr -d '[:space:]')"
+          [[ "$number" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || { echo "::error::VERSION '$number' isn't a version number"; exit 1; }
+          tag="${TAG_INPUT:-v$number}"
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+
+      # The plugin shim and its scan helper, for this Mac architecture (the runner is Apple Silicon;
+      # clang builds Intel too). The C ABI tests are Windows and Linux only (native/CMakeLists.txt).
+      - name: Build the plugin shim
+        working-directory: src
+        run: |
+          cmake -S native -B native/build -DCMAKE_BUILD_TYPE=Release -DASH_BUILD_TESTS=OFF \
+            -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0
+          cmake --build native/build --config Release
+          lipo -info native/build/libauralyn_plugin_shim.dylib
+
+      - name: Publish (self-contained)
+        working-directory: src
+        run: >
+          dotnet publish src/AuralynShowtime.Desktop/AuralynShowtime.Desktop.csproj
+          -c Release -r ${{ matrix.rid }} --self-contained true
+          -p:Version=${{ steps.version.outputs.number }}
+          -o "$GITHUB_WORKSPACE/publish"
+
+      - name: Add the plugin shim
+        run: |
+          cp src/native/build/libauralyn_plugin_shim.dylib publish/
+          cp src/native/build/auralyn-plugin-scan publish/
+          chmod +x publish/auralyn-plugin-scan
+
+      # The same bundle as the release workflow's: the local-network and microphone lines macOS
+      # asks for, the notices in Resources, and an ad-hoc signature (Apple Silicon runs nothing
+      # unsigned). No Apple Developer account yet: the first open is right-click > Open.
+      - name: Make the .app bundle
         env:
           VERSION: ${{ steps.version.outputs.number }}
         run: |
-          set -euo pipefail
-          shim_files=$(find native/build -type f \( -name '*auralyn_plugin_shim*.dylib' -o -name 'auralyn-plugin-scan' \) -not -path '*/CMakeFiles/*')
-          if [ -z "$shim_files" ]; then
-            echo "::error::The plugin shim build produced no .dylib or scan helper."
-            exit 1
-          fi
-          notes=""
-          [ -f docs/RELEASE_NOTES.md ] && notes="--releaseNotes docs/RELEASE_NOTES.md"
+          APP="Auralyn Showtime.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp -R publish/. "$APP/Contents/MacOS/"
+          chmod +x "$APP/Contents/MacOS/AuralynShowtime"
+          cp src/THIRD-PARTY-NOTICES.txt "$APP/Contents/Resources/"
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Auralyn Showtime</string>
+            <key>CFBundleDisplayName</key><string>Auralyn Showtime</string>
+            <key>CFBundleIdentifier</key><string>com.auralyn.showtime</string>
+            <key>CFBundleExecutable</key><string>AuralynShowtime</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$VERSION</string>
+            <key>CFBundleVersion</key><string>$VERSION</string>
+            <key>LSMinimumSystemVersion</key><string>14.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>NSLocalNetworkUsageDescription</key><string>Auralyn Showtime talks to your mixing desk and to paired phones on this network.</string>
+            <key>NSMicrophoneUsageDescription</key><string>Auralyn Showtime records your mixing desk's USB inputs when you press Record.</string>
+          </dict>
+          </plist>
+          PLIST
+          plutil -lint "$APP/Contents/Info.plist"
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict "$APP"
+          ditto -c -k --keepParent "$APP" "AuralynShowtime-${VERSION}-Mac-${{ matrix.name }}.zip"
 
-          for rid in osx-arm64 osx-x64; do
-            dotnet publish src/AuralynShowtime.Desktop/AuralynShowtime.Desktop.csproj \
-              -c Release -r "$rid" --self-contained true -p:Version="$VERSION" -o "publish/$rid"
-            for f in $shim_files; do cp "$f" "publish/$rid/"; done
-            cp THIRD-PARTY-NOTICES.txt "publish/$rid/"
+      - name: Install vpk
+        run: dotnet tool update -g vpk --version ${{ env.VPK_VERSION }}
 
-            # Each architecture is its own update channel, so the two never overwrite each other's files.
-            vpk pack --packId AuralynShowtime --packVersion "$VERSION" --packDir "publish/$rid" \
-              --mainExe AuralynShowtime --packTitle "Auralyn Showtime" \
-              --runtime "$rid" --channel "$rid" --outputDir "artifacts/mac/$rid" $notes
-          done
-          ls -la artifacts/mac/*
+      # The self-updating package: each architecture on its own channel, so an installed copy only
+      # ever updates to its own build. The previous package (if any) lets vpk make a small delta.
+      - name: Download the previous Mac package
+        continue-on-error: true
+        run: >
+          vpk download github --repoUrl "https://github.com/${{ github.repository }}"
+          --channel ${{ matrix.rid }} --outputDir Releases --token "${{ github.token }}"
 
-      - name: Attach to the release
+      - name: Package with Velopack
+        run: >
+          vpk pack --packId AuralynShowtime --packVersion ${{ steps.version.outputs.number }}
+          --packDir "Auralyn Showtime.app" --mainExe AuralynShowtime --packTitle "Auralyn Showtime"
+          --channel ${{ matrix.rid }} --runtime ${{ matrix.rid }} --outputDir Releases
+
+      - name: Add to the release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.number }}
         run: |
-          set -euo pipefail
-          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --title "Auralyn Showtime ${TAG#v}" --notes "Mac builds for Apple Silicon and Intel."
-          fi
-          find artifacts/mac -type f ! -name 'assets.*.json' -print0 \
-            | xargs -0 gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber
+          vpk upload github --repoUrl "https://github.com/${{ github.repository }}" \
+            --channel ${{ matrix.rid }} --outputDir Releases --merge --publish \
+            --releaseName "Auralyn Showtime $VERSION" --tag "$TAG" --token "$GH_TOKEN"
+          gh release upload "$TAG" "AuralynShowtime-${VERSION}-Mac-${{ matrix.name }}.zip" \
+            --repo "${{ github.repository }}" --clobber
 
       - uses: actions/upload-artifact@v4
         with:
-          name: auralyn-showtime-mac-${{ steps.version.outputs.number }}
-          path: artifacts/mac/
+          name: auralyn-showtime-${{ steps.version.outputs.number }}-mac-${{ matrix.name }}
+          path: |
+            Releases/
+            AuralynShowtime-*-Mac-*.zip
           retention-days: 14
