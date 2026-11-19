@@ -15,9 +15,10 @@
 # signature, and a self-updating Velopack package on its own channel (osx-arm64 / osx-x64), and
 # adds them to the release.
 #
-# The logs of a public repository are public: they show test names and file paths from the
-# private source, never the source itself. The whole test suite runs on a Mac first (on by default)
-# and nothing is attached unless it passes.
+# The logs of a public repository are public, so the source never reaches them: the tests print
+# only each project's count and the names of failing tests (no messages or stack traces), and the
+# build only its errors. The whole test suite runs on a Mac first (on by default) and nothing is
+# attached unless it passes.
 name: Build Mac
 
 on:
@@ -57,6 +58,8 @@ jobs:
     if: inputs.test
     runs-on: macos-latest
     timeout-minutes: 90
+    permissions:
+      contents: read
     steps:
       - name: Check out the app's source
         uses: actions/checkout@v7
@@ -70,8 +73,17 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
+      # The full output stays on the runner: a failing test's message or stack trace would put the
+      # private source in this public log.
       - name: Test on a Mac
-        run: dotnet test AuralynShowtime.slnx -c Release
+        run: |
+          set +e
+          dotnet test AuralynShowtime.slnx -c Release -v q -clp:ErrorsOnly --nologo > "$RUNNER_TEMP/test.log" 2>&1
+          code=$?
+          set -e
+          grep -E '^(Passed!|Failed!)' "$RUNNER_TEMP/test.log" | sed -E 's/ - [^ ]+\.dll.*$//' || true
+          grep -E '^[[:space:]]+Failed [A-Za-z0-9_.]+' "$RUNNER_TEMP/test.log" | sed -E 's/ \[.*$//' || true
+          if [ "$code" -ne 0 ]; then echo "::error::The tests failed (exit code $code)."; exit "$code"; fi
 
   mac:
     needs: test
@@ -134,6 +146,7 @@ jobs:
           -c Release -r ${{ matrix.rid }} --self-contained true
           -p:Version=${{ steps.version.outputs.number }}
           -o "$GITHUB_WORKSPACE/publish"
+          -v q -clp:ErrorsOnly --nologo
 
       - name: Add the plugin shim
         run: |
