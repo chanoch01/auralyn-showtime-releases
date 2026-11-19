@@ -1,0 +1,130 @@
+# Builds the Mac versions of Auralyn Showtime (Apple Silicon and Intel) and attaches them to a
+# release in this repository. This repository is public, so GitHub's Mac runners cost nothing here,
+# while the private code repository would pay for every Mac minute.
+#
+# Started by hand: Actions → Build Mac → Run workflow. It reads the private source with one secret,
+# set in this repository's Settings → Secrets and variables → Actions:
+#   SOURCE_READ_TOKEN  a fine-grained token with "Contents: read-only" on chanoch01/auralyn-showtime only.
+#
+# Note: this repository is public, so the build log below can be read by anyone. It shows test
+# names and file paths from the private source, not the source itself.
+name: Build Mac
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release to attach the Mac builds to (made if it doesn't exist yet)
+        required: true
+        default: v1.0.1
+      ref:
+        description: Branch, tag or commit of chanoch01/auralyn-showtime to build
+        required: true
+        default: main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-mac-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  # Must match the Velopack package version in src/AuralynShowtime.Desktop/AuralynShowtime.Desktop.csproj.
+  VPK_VERSION: 1.2.161
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+  DOTNET_NOLOGO: '1'
+
+jobs:
+  mac:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out the app's source
+        uses: actions/checkout@v4
+        with:
+          repository: chanoch01/auralyn-showtime
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Tools
+        run: |
+          cmake --version
+          dotnet tool update -g vpk --version "$VPK_VERSION"
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+
+      # The release's number comes from the tag (v1.0.1 → 1.0.1), so the Mac and Windows builds agree.
+      - name: Version
+        id: version
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          number="${TAG#v}"
+          if ! [[ "$number" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::The tag must look like v1.2.3, not '$TAG'."
+            exit 1
+          fi
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+
+      # One universal build of the plugin shim (VST 3 hosting) serves both Macs.
+      - name: Build the plugin shim (universal)
+        run: |
+          cmake -S native -B native/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+          cmake --build native/build --config Release
+
+      - name: Test the plugin shim
+        run: ctest --test-dir native/build -C Release --output-on-failure
+
+      # Nothing is attached unless every test passes.
+      - name: Test
+        run: dotnet test AuralynShowtime.slnx -c Release
+
+      - name: Publish and pack (Apple Silicon and Intel)
+        env:
+          VERSION: ${{ steps.version.outputs.number }}
+        run: |
+          set -euo pipefail
+          shim_files=$(find native/build -type f \( -name '*auralyn_plugin_shim*.dylib' -o -name 'auralyn-plugin-scan' \) -not -path '*/CMakeFiles/*')
+          if [ -z "$shim_files" ]; then
+            echo "::error::The plugin shim build produced no .dylib or scan helper."
+            exit 1
+          fi
+          notes=""
+          [ -f docs/RELEASE_NOTES.md ] && notes="--releaseNotes docs/RELEASE_NOTES.md"
+
+          for rid in osx-arm64 osx-x64; do
+            dotnet publish src/AuralynShowtime.Desktop/AuralynShowtime.Desktop.csproj \
+              -c Release -r "$rid" --self-contained true -p:Version="$VERSION" -o "publish/$rid"
+            for f in $shim_files; do cp "$f" "publish/$rid/"; done
+            cp THIRD-PARTY-NOTICES.txt "publish/$rid/"
+
+            # Each architecture is its own update channel, so the two never overwrite each other's files.
+            vpk pack --packId AuralynShowtime --packVersion "$VERSION" --packDir "publish/$rid" \
+              --mainExe AuralynShowtime --packTitle "Auralyn Showtime" \
+              --runtime "$rid" --channel "$rid" --outputDir "artifacts/mac/$rid" $notes
+          done
+          ls -la artifacts/mac/*
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "Auralyn Showtime ${TAG#v}" --notes "Mac builds for Apple Silicon and Intel."
+          fi
+          find artifacts/mac -type f ! -name 'assets.*.json' -print0 \
+            | xargs -0 gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: auralyn-showtime-mac-${{ steps.version.outputs.number }}
+          path: artifacts/mac/
+          retention-days: 14
