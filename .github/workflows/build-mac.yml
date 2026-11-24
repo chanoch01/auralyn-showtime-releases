@@ -165,6 +165,7 @@ jobs:
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp -R publish/. "$APP/Contents/MacOS/"
           chmod +x "$APP/Contents/MacOS/AuralynShowtime"
+          cp src/src/AuralynShowtime.Desktop/Assets/Icon/showtime.icns "$APP/Contents/Resources/"
           cp src/THIRD-PARTY-NOTICES.txt "$APP/Contents/Resources/"
           cat > "$APP/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
@@ -176,6 +177,7 @@ jobs:
             <key>CFBundleIdentifier</key><string>com.auralyn.showtime</string>
             <key>CFBundleExecutable</key><string>AuralynShowtime</string>
             <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleIconFile</key><string>showtime</string>
             <key>CFBundleShortVersionString</key><string>$VERSION</string>
             <key>CFBundleVersion</key><string>$VERSION</string>
             <key>LSMinimumSystemVersion</key><string>14.0</string>
